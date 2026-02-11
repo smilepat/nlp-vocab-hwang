@@ -1,0 +1,5 @@
+{
+  "name": "Smart AI Worksheet Generator",
+  "description": "Generate customized English worksheets based on grade, words, question types, and counts using Gemini AI.",
+  "requestFramePermissions": []
+}
