@@ -18,6 +18,55 @@ function toLevelKorean(level: string): string {
   return map[level] || level;
 }
 
+// === 단어 유효성 검증 (AI/오프라인 공용) ===
+export async function validateWordsInData(result: AnalysisResult): Promise<AnalysisResult> {
+  if (!result.extracted.words) return result;
+
+  const wordIndex = await loadWordIndex();
+  const requestedWords = result.extracted.words.split(',').map(w => w.trim().toLowerCase()).filter(w => w);
+
+  // Build word → levels map
+  const wordLevelMap = new Map<string, string[]>();
+  for (const entry of wordIndex) {
+    const w = entry.w.toLowerCase();
+    if (!wordLevelMap.has(w)) wordLevelMap.set(w, []);
+    if (!wordLevelMap.get(w)!.includes(entry.l)) wordLevelMap.get(w)!.push(entry.l);
+  }
+
+  const foundWords = requestedWords.filter(w => wordLevelMap.has(w));
+
+  if (foundWords.length === 0) {
+    result.dataExists = false;
+    result.isComplete = false;
+    result.feedbackMessage = `해당 단어(${result.extracted.words})가 마스터 데이터에 없습니다. 다른 단어를 입력해주세요.`;
+  } else if (result.extracted.grade) {
+    // Check if words match the requested grade level
+    const mismatched: { word: string; levels: string[] }[] = [];
+    for (const w of foundWords) {
+      const levels = wordLevelMap.get(w) || [];
+      if (!levels.includes(result.extracted.grade)) {
+        mismatched.push({ word: w, levels });
+      }
+    }
+
+    if (mismatched.length > 0 && mismatched.length === foundWords.length) {
+      result.dataExists = false;
+      result.isComplete = false;
+      const details = mismatched.map(m =>
+        `'${m.word}'은(는) ${m.levels.map(toLevelKorean).join(', ')} 레벨의 단어입니다.`
+      ).join(' ');
+      result.feedbackMessage = `${details} ${toLevelKorean(result.extracted.grade)} 레벨에 해당하지 않습니다. 다른 단어를 입력하거나 레벨을 변경해주세요.`;
+    } else {
+      result.dataExists = true;
+    }
+  } else {
+    result.dataExists = true;
+  }
+
+  return result;
+}
+
+// === AI 기반 사용자 입력 분석 ===
 export const analyzeUserPrompt = async (userInput: string): Promise<AnalysisResult> => {
   // Step 1: AI extracts parameters only (no word list sent)
   const response = await ai.models.generateContent({
@@ -62,52 +111,8 @@ export const analyzeUserPrompt = async (userInput: string): Promise<AnalysisResu
 
   const result = JSON.parse(response.text || '{}') as AnalysisResult;
 
-  // Step 2: Client-side word validation against the master word index
-  if (result.extracted.words) {
-    const wordIndex = await loadWordIndex();
-    const requestedWords = result.extracted.words.split(',').map(w => w.trim().toLowerCase()).filter(w => w);
-
-    // Build word → levels map
-    const wordLevelMap = new Map<string, string[]>();
-    for (const entry of wordIndex) {
-      const w = entry.w.toLowerCase();
-      if (!wordLevelMap.has(w)) wordLevelMap.set(w, []);
-      if (!wordLevelMap.get(w)!.includes(entry.l)) wordLevelMap.get(w)!.push(entry.l);
-    }
-
-    const foundWords = requestedWords.filter(w => wordLevelMap.has(w));
-
-    if (foundWords.length === 0) {
-      result.dataExists = false;
-      result.isComplete = false;
-      result.feedbackMessage = `해당 단어(${result.extracted.words})가 마스터 데이터에 없습니다. 다른 단어를 입력해주세요.`;
-    } else if (result.extracted.grade) {
-      // Check if words match the requested grade level
-      const mismatched: { word: string; levels: string[] }[] = [];
-      for (const w of foundWords) {
-        const levels = wordLevelMap.get(w) || [];
-        if (!levels.includes(result.extracted.grade)) {
-          mismatched.push({ word: w, levels });
-        }
-      }
-
-      if (mismatched.length > 0 && mismatched.length === foundWords.length) {
-        // ALL requested words don't match the grade level
-        result.dataExists = false;
-        result.isComplete = false;
-        const details = mismatched.map(m =>
-          `'${m.word}'은(는) ${m.levels.map(toLevelKorean).join(', ')} 레벨의 단어입니다.`
-        ).join(' ');
-        result.feedbackMessage = `${details} ${toLevelKorean(result.extracted.grade)} 레벨에 해당하지 않습니다. 다른 단어를 입력하거나 레벨을 변경해주세요.`;
-      } else {
-        result.dataExists = true;
-      }
-    } else {
-      result.dataExists = true;
-    }
-  }
-
-  return result;
+  // Step 2: 단어 유효성 검증
+  return validateWordsInData(result);
 };
 
 // --- Pre-generated question parser ---
@@ -220,7 +225,6 @@ export const generateWorksheet = async (config: GeneratorConfig): Promise<Worksh
   );
 
   if (vocabWithQuestions.length === 0) {
-    // 조건이 맞지 않아 문제를 가져올 수 없음
     return null;
   }
 
@@ -238,12 +242,22 @@ export const generateWorksheet = async (config: GeneratorConfig): Promise<Worksh
     return null;
   }
 
+  // === Feature 2: 문제 유형 필터링 ===
+  let questionsPool = allQuestions;
+  if (config.questionTypes && config.questionTypes.length > 0) {
+    questionsPool = allQuestions.filter(q => config.questionTypes!.includes(q.type));
+  }
+
+  if (questionsPool.length === 0) {
+    return null;
+  }
+
   // Shuffle for variety
-  const shuffled = [...allQuestions].sort(() => Math.random() - 0.5);
+  const shuffled = [...questionsPool].sort(() => Math.random() - 0.5);
 
   // Select questions, diversifying by word (max 2 per word initially)
   const selectedByWord: Record<string, number> = {};
-  const selected: typeof allQuestions = [];
+  const selected: typeof questionsPool = [];
 
   for (const q of shuffled) {
     if (selected.length >= count) break;

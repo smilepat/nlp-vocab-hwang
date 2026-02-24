@@ -20,6 +20,7 @@ export interface GeneratorConfig {
   topic: string | null;
   words: string | null;
   count: number | null;
+  questionTypes?: string[];
 }
 
 export interface AnalysisResult {
@@ -42,4 +43,23 @@ export interface VocabItem {
   koreanCurriculum: string;
   questionTypes: string[];
   preGeneratedQuestions?: Record<string, string>;
+}
+
+// === Feature 3: 문제지 커스텀 헤더 ===
+export interface WorksheetHeader {
+  schoolName: string;
+  className: string;
+  teacherName: string;
+  date: string;
+  timeLimit: string;
+  studentNameField: boolean;
+}
+
+// === Feature 4: 문제지 이력 관리 ===
+export interface WorksheetHistoryItem {
+  id: string;
+  worksheet: Worksheet;
+  header: WorksheetHeader;
+  createdAt: string;
+  config: GeneratorConfig;
 }

@@ -1,9 +1,9 @@
 
-import React, { useState, useRef, useEffect } from 'react';
-import { 
-  Sparkles, 
-  RefreshCw, 
-  CheckCircle2, 
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import {
+  Sparkles,
+  RefreshCw,
+  CheckCircle2,
   Printer,
   Database,
   ArrowRight,
@@ -25,11 +25,21 @@ import {
   Trash2,
   Plus,
   Table as TableIcon,
-  CloudUpload
+  CloudUpload,
+  WifiOff,
+  Filter,
+  Clock,
+  History,
+  ChevronDown,
+  ChevronUp,
+  Calendar,
+  BookmarkPlus,
+  FolderOpen
 } from 'lucide-react';
-import { analyzeUserPrompt, generateWorksheet } from './services/geminiService';
-import { Worksheet, GeneratorConfig, AnalysisResult } from './types';
-import { GRADE_LEVELS, loadTableVocab } from './constants';
+import { analyzeUserPrompt, generateWorksheet, validateWordsInData } from './services/geminiService';
+import { analyzeOffline } from './services/offlineParser';
+import { Worksheet, GeneratorConfig, AnalysisResult, WorksheetHeader, WorksheetHistoryItem } from './types';
+import { GRADE_LEVELS, QUESTION_TYPE_NAMES, loadTableVocab } from './constants';
 import type { VocabItem } from './types';
 
 export default function App() {
@@ -41,7 +51,29 @@ export default function App() {
   const [worksheet, setWorksheet] = useState<Worksheet | null>(null);
   const [showAnswers, setShowAnswers] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+
+  // Feature 1: 오프라인 모드 표시
+  const [isOfflineMode, setIsOfflineMode] = useState(false);
+
+  // Feature 2: 문제 유형 선택
+  const [selectedQuestionTypes, setSelectedQuestionTypes] = useState<string[]>([...QUESTION_TYPE_NAMES]);
+  const [showTypeFilter, setShowTypeFilter] = useState(false);
+
+  // Feature 3: 문제지 커스텀 헤더
+  const [worksheetHeader, setWorksheetHeader] = useState<WorksheetHeader>({
+    schoolName: '',
+    className: '',
+    teacherName: '',
+    date: new Date().toISOString().split('T')[0],
+    timeLimit: '',
+    studentNameField: true,
+  });
+  const [showHeaderForm, setShowHeaderForm] = useState(false);
+
+  // Feature 4: 문제지 이력 관리
+  const [history, setHistory] = useState<WorksheetHistoryItem[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+
   // Master Table States
   const [showMasterTable, setShowMasterTable] = useState(false);
   const [isEditMode, setIsEditMode] = useState(false);
@@ -81,26 +113,61 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [analysis, worksheet, isAnalyzing, isGenerating, error]);
 
+  // Feature 4: Load history from localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('vocamaster_history');
+      if (saved) setHistory(JSON.parse(saved));
+    } catch (e) { /* ignore */ }
+  }, []);
+
+  const saveHistory = useCallback((ws: Worksheet, hdr: WorksheetHeader, cfg: GeneratorConfig) => {
+    const item: WorksheetHistoryItem = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      worksheet: ws,
+      header: hdr,
+      config: cfg,
+      createdAt: new Date().toISOString(),
+    };
+    setHistory(prev => {
+      const updated = [item, ...prev].slice(0, 20);
+      try { localStorage.setItem('vocamaster_history', JSON.stringify(updated)); } catch (e) { }
+      return updated;
+    });
+  }, []);
+
   const handleStartAnalysis = async (input: string) => {
     if (!input.trim()) return;
     setIsAnalyzing(true);
     setError(null);
     setWorksheet(null);
-    
+    setIsOfflineMode(false);
+
     try {
-      const result = await analyzeUserPrompt(input);
+      const hasApiKey = !!(process.env.API_KEY || process.env.GEMINI_API_KEY);
+      let result: AnalysisResult;
+
+      if (hasApiKey) {
+        try {
+          result = await analyzeUserPrompt(input);
+        } catch (aiErr: any) {
+          console.warn('AI 분석 실패, 오프라인 파서로 전환:', aiErr);
+          result = analyzeOffline(input);
+          result = await validateWordsInData(result);
+          setIsOfflineMode(true);
+        }
+      } else {
+        result = analyzeOffline(input);
+        result = await validateWordsInData(result);
+        setIsOfflineMode(true);
+      }
+
       setAnalysis(result);
       setRefinementInput('');
+      setSelectedQuestionTypes([...QUESTION_TYPE_NAMES]);
     } catch (err: any) {
-      console.error("Analysis error:", err);
-      const msg = err?.message || String(err);
-      if (msg.includes('API_KEY') || msg.includes('401') || msg.includes('403') || msg.includes('key')) {
-        setError("API 키가 유효하지 않습니다. .env.local 파일의 GEMINI_API_KEY를 확인해주세요.");
-      } else if (msg.includes('fetch') || msg.includes('network') || msg.includes('Failed')) {
-        setError("네트워크 오류가 발생했습니다. 인터넷 연결을 확인해주세요.");
-      } else {
-        setError(`요청을 분석하는 중 오류가 발생했습니다: ${msg}`);
-      }
+      console.error('Analysis error:', err);
+      setError(`요청을 분석하는 중 오류가 발생했습니다: ${err?.message || String(err)}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -116,7 +183,7 @@ export default function App() {
   const handleRefineQuick = (field: keyof GeneratorConfig, value: any) => {
     if (!analysis) return;
     const updatedExtracted = { ...analysis.extracted, [field]: value };
-    
+
     const missing = [];
     if (!updatedExtracted.grade) missing.push('grade');
     if (!updatedExtracted.topic && !updatedExtracted.words) missing.push('topic');
@@ -127,25 +194,32 @@ export default function App() {
       extracted: updatedExtracted,
       isComplete: missing.length === 0 && analysis.dataExists,
       missingFields: missing,
-      feedbackMessage: (missing.length === 0 && analysis.dataExists) 
-        ? "모든 정보가 준비되었습니다! 아래 버튼을 눌러 문제를 제작하세요." 
+      feedbackMessage: (missing.length === 0 && analysis.dataExists)
+        ? "모든 정보가 준비되었습니다! 아래 버튼을 눌러 문제를 제작하세요."
         : analysis.feedbackMessage
     });
   };
 
+  // Feature 2: Pass selected question types to generator
   const handleTriggerGenerate = async () => {
     if (!analysis || !analysis.isComplete) return;
     setIsGenerating(true);
     setError(null);
     try {
-      const result = await generateWorksheet(analysis.extracted);
+      const configWithTypes: GeneratorConfig = {
+        ...analysis.extracted,
+        questionTypes: selectedQuestionTypes,
+      };
+      const result = await generateWorksheet(configWithTypes);
       if (result) {
         setWorksheet(result);
+        // Feature 4: Auto-save to history
+        saveHistory(result, worksheetHeader, configWithTypes);
       } else {
-        setError("조건이 맞지 않아 문제를 생성할 수 없습니다. 마스터 테이블에 해당 조건에 맞는 문제 데이터가 없습니다.");
+        setError('선택한 조건에 맞는 문제가 없습니다. 문제 유형 필터를 확인하거나 다른 조건으로 시도해주세요.');
       }
     } catch (err) {
-      setError("문제 생성 도중 예상치 못한 오류가 발생했습니다.");
+      setError('문제 생성 도중 예상치 못한 오류가 발생했습니다.');
     } finally {
       setIsGenerating(false);
     }
@@ -158,6 +232,26 @@ export default function App() {
     setWorksheet(null);
     setShowAnswers(false);
     setError(null);
+    setIsOfflineMode(false);
+    setSelectedQuestionTypes([...QUESTION_TYPE_NAMES]);
+    setShowTypeFilter(false);
+    setShowHeaderForm(false);
+  };
+
+  // Feature 4: History handlers
+  const handleLoadHistory = (item: WorksheetHistoryItem) => {
+    setWorksheet(item.worksheet);
+    setWorksheetHeader(item.header);
+    setShowHistory(false);
+    setAnalysis(null);
+  };
+
+  const handleDeleteHistory = (id: string) => {
+    setHistory(prev => {
+      const updated = prev.filter(h => h.id !== id);
+      try { localStorage.setItem('vocamaster_history', JSON.stringify(updated)); } catch (e) { }
+      return updated;
+    });
   };
 
   // Table Management Functions
@@ -237,16 +331,33 @@ export default function App() {
               <Database size={20} />
             </div>
             <h1 className="text-lg font-black tracking-tight">VocaMaster <span className="text-indigo-600">AI</span></h1>
+            {isOfflineMode && (
+              <span className="flex items-center gap-1 px-2 py-1 bg-amber-50 text-amber-600 text-[9px] font-black rounded-lg border border-amber-200">
+                <WifiOff size={10} /> 오프라인
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
-            <button 
+            <button
+              onClick={() => setShowHistory(true)}
+              className="flex items-center gap-2 px-4 py-2 bg-white text-slate-600 rounded-xl text-xs font-black hover:bg-slate-50 transition-all border-2 border-slate-100 shadow-sm relative"
+              title="문제지 이력 보기"
+            >
+              <History size={16} />
+              이력
+              {history.length > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-indigo-600 text-white text-[9px] font-black rounded-full flex items-center justify-center">{history.length}</span>
+              )}
+            </button>
+            <button
               onClick={() => setShowMasterTable(true)}
               className="flex items-center gap-2 px-4 py-2 bg-white text-indigo-600 rounded-xl text-xs font-black hover:bg-indigo-50 transition-all border-2 border-indigo-100 shadow-sm"
+              title="마스터 테이블 보기"
             >
               <BookOpen size={16} />
-              마스터 테이블 보기
+              마스터 테이블
             </button>
-            <button onClick={handleReset} className="p-2 text-slate-400 hover:text-indigo-600 transition-colors">
+            <button onClick={handleReset} className="p-2 text-slate-400 hover:text-indigo-600 transition-colors" title="초기화">
               <RotateCcw size={18} />
             </button>
           </div>
@@ -333,13 +444,13 @@ export default function App() {
                     <div className="absolute -top-3 left-6 px-2 bg-white text-[10px] font-black text-indigo-500 uppercase tracking-widest z-10 flex items-center gap-1">
                       <MessageSquarePlus size={12} /> 추가 요청 사항 입력
                     </div>
-                    <textarea 
+                    <textarea
                       value={refinementInput}
                       onChange={(e) => setRefinementInput(e.target.value)}
                       placeholder="예: 10문제로 늘려줘, 초등학교 수준으로 바꿔줘 등"
                       className="w-full p-6 pt-8 bg-slate-50 border border-slate-200 rounded-3xl focus:ring-2 focus:ring-indigo-500 focus:bg-white outline-none transition-all h-24 resize-none text-sm font-medium shadow-inner"
                     />
-                    <button 
+                    <button
                       onClick={handleUpdatePrompt}
                       disabled={!refinementInput.trim() || isAnalyzing}
                       className="absolute right-3 bottom-3 p-3 bg-indigo-600 text-white rounded-2xl shadow-lg hover:bg-indigo-700 transition-all disabled:opacity-30"
@@ -384,13 +495,107 @@ export default function App() {
                       <CheckCircle2 size={20} className="shrink-0" />
                       <p className="text-sm font-bold leading-tight">준비 완료: {analysis.extracted.grade}, {analysis.extracted.count}문항, "{analysis.extracted.topic || analysis.extracted.words}" 주제</p>
                     </div>
+
+                    {/* Feature 2: 문제 유형 필터 */}
+                    <div className="bg-slate-50 rounded-3xl border border-slate-100 overflow-hidden">
+                      <button
+                        onClick={() => setShowTypeFilter(!showTypeFilter)}
+                        className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-100 transition-colors"
+                        title="문제 유형 필터 토글"
+                      >
+                        <div className="flex items-center gap-2">
+                          <Filter size={16} className="text-indigo-600" />
+                          <span className="text-xs font-black text-slate-700">문제 유형 선택</span>
+                          <span className="text-[10px] font-bold text-indigo-500 bg-indigo-50 px-2 py-0.5 rounded-lg">
+                            {selectedQuestionTypes.length}/{QUESTION_TYPE_NAMES.length} 선택됨
+                          </span>
+                        </div>
+                        {showTypeFilter ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
+                      </button>
+                      {showTypeFilter && (
+                        <div className="px-6 pb-5 space-y-3">
+                          <div className="flex gap-2 mb-2">
+                            <button onClick={() => setSelectedQuestionTypes([...QUESTION_TYPE_NAMES])} className="px-3 py-1 bg-indigo-600 text-white rounded-lg text-[10px] font-black hover:bg-indigo-700 transition">전체 선택</button>
+                            <button onClick={() => setSelectedQuestionTypes([])} className="px-3 py-1 bg-white border border-slate-200 text-slate-600 rounded-lg text-[10px] font-black hover:bg-slate-50 transition">전체 해제</button>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            {QUESTION_TYPE_NAMES.map(t => (
+                              <label key={t} className={`flex items-center gap-2 px-3 py-2.5 rounded-xl border cursor-pointer transition-all text-[11px] font-bold ${selectedQuestionTypes.includes(t) ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-100 text-slate-400'}`}>
+                                <input
+                                  type="checkbox"
+                                  checked={selectedQuestionTypes.includes(t)}
+                                  onChange={() => {
+                                    setSelectedQuestionTypes(prev =>
+                                      prev.includes(t) ? prev.filter(x => x !== t) : [...prev, t]
+                                    );
+                                  }}
+                                  className="accent-indigo-600 w-3.5 h-3.5"
+                                />
+                                {t}
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Feature 3: 문제지 헤더 정보 */}
+                    <div className="bg-slate-50 rounded-3xl border border-slate-100 overflow-hidden">
+                      <button
+                        onClick={() => setShowHeaderForm(!showHeaderForm)}
+                        className="w-full flex items-center justify-between px-6 py-4 hover:bg-slate-100 transition-colors"
+                        title="문제지 정보 설정 토글"
+                      >
+                        <div className="flex items-center gap-2">
+                          <Edit3 size={16} className="text-indigo-600" />
+                          <span className="text-xs font-black text-slate-700">문제지 정보 설정</span>
+                          <span className="text-[10px] font-medium text-slate-400">선택사항</span>
+                        </div>
+                        {showHeaderForm ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
+                      </button>
+                      {showHeaderForm && (
+                        <div className="px-6 pb-5 space-y-3">
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">학교명</label>
+                              <input value={worksheetHeader.schoolName} onChange={e => setWorksheetHeader(h => ({ ...h, schoolName: e.target.value }))} placeholder="OO중학교" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-medium outline-none focus:ring-2 focus:ring-indigo-500" />
+                            </div>
+                            <div>
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">학년 / 반</label>
+                              <input value={worksheetHeader.className} onChange={e => setWorksheetHeader(h => ({ ...h, className: e.target.value }))} placeholder="2학년 3반" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-medium outline-none focus:ring-2 focus:ring-indigo-500" />
+                            </div>
+                            <div>
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">교사명</label>
+                              <input value={worksheetHeader.teacherName} onChange={e => setWorksheetHeader(h => ({ ...h, teacherName: e.target.value }))} placeholder="홍길동" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-medium outline-none focus:ring-2 focus:ring-indigo-500" />
+                            </div>
+                            <div>
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">날짜</label>
+                              <input type="date" value={worksheetHeader.date} onChange={e => setWorksheetHeader(h => ({ ...h, date: e.target.value }))} placeholder="YYYY-MM-DD" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-medium outline-none focus:ring-2 focus:ring-indigo-500" />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">시간 제한</label>
+                              <input value={worksheetHeader.timeLimit} onChange={e => setWorksheetHeader(h => ({ ...h, timeLimit: e.target.value }))} placeholder="30분" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-medium outline-none focus:ring-2 focus:ring-indigo-500" />
+                            </div>
+                            <div className="flex items-end pb-1">
+                              <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-600">
+                                <input type="checkbox" checked={worksheetHeader.studentNameField} onChange={e => setWorksheetHeader(h => ({ ...h, studentNameField: e.target.checked }))} className="accent-indigo-600 w-4 h-4" />
+                                학생 성명란 표시
+                              </label>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
                     <button
                       onClick={handleTriggerGenerate}
-                      disabled={isGenerating}
-                      className="w-full py-6 bg-indigo-600 text-white rounded-[24px] font-black text-xl shadow-2xl shadow-indigo-200 hover:bg-indigo-700 hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center gap-3 group"
+                      disabled={isGenerating || selectedQuestionTypes.length === 0}
+                      className="w-full py-6 bg-indigo-600 text-white rounded-[24px] font-black text-xl shadow-2xl shadow-indigo-200 hover:bg-indigo-700 hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center gap-3 group disabled:opacity-40"
                     >
                       {isGenerating ? <RefreshCw className="animate-spin" size={24} /> : <Wand2 className="group-hover:rotate-12 transition-transform" size={24} />}
-                      {isGenerating ? "문제집 생성 중..." : "문제 제작 시작하기"}
+                      {isGenerating ? "문제집 생성 중..." : selectedQuestionTypes.length === 0 ? "문제 유형을 선택해주세요" : "문제 제작 시작하기"}
                     </button>
                   </div>
                 ) : (
@@ -398,7 +603,7 @@ export default function App() {
                     <div className="p-8 border-2 border-dashed border-red-200 rounded-[32px] flex flex-col items-center justify-center text-red-500 bg-red-50/30">
                       <XCircle size={32} className="mb-3 opacity-50" />
                       <p className="font-black uppercase tracking-widest text-sm mb-2">데이터 없음</p>
-                      <p className="text-xs font-bold text-center opacity-70">마스터 테이블에 해당 단어나 주제가 없습니다. <br/> "마스터 테이블 보기" 버튼을 눌러 목록을 확인해주세요.</p>
+                      <p className="text-xs font-bold text-center opacity-70">마스터 테이블에 해당 단어나 주제가 없습니다. <br /> "마스터 테이블 보기" 버튼을 눌러 목록을 확인해주세요.</p>
                       <button onClick={handleReset} className="mt-6 px-6 py-2 bg-red-600 text-white rounded-xl text-[10px] font-black hover:bg-red-700 transition shadow-lg">새로 입력하기</button>
                     </div>
                   ) : (
@@ -416,7 +621,30 @@ export default function App() {
         {/* Worksheet Result Area */}
         {worksheet && !isGenerating && (
           <div className="bg-white rounded-[40px] shadow-2xl border border-slate-100 overflow-hidden animate-in fade-in slide-in-from-bottom-10 duration-700">
-            {/* Header omitted for brevity as it is unchanged from original logic */}
+            {/* Feature 3: Printable Header */}
+            {(worksheetHeader.schoolName || worksheetHeader.teacherName || worksheetHeader.className) && (
+              <div className="p-10 pb-0 print-header">
+                <div className="border-b-2 border-slate-800 pb-4 mb-2">
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      {worksheetHeader.schoolName && <p className="text-lg font-black text-slate-900">{worksheetHeader.schoolName}</p>}
+                      {worksheetHeader.className && <p className="text-sm font-bold text-slate-500">{worksheetHeader.className}</p>}
+                    </div>
+                    <div className="text-right text-sm">
+                      {worksheetHeader.date && <p className="font-bold text-slate-600"><Calendar size={12} className="inline mr-1" />{worksheetHeader.date}</p>}
+                      {worksheetHeader.teacherName && <p className="text-slate-500 font-medium">출제: {worksheetHeader.teacherName}</p>}
+                      {worksheetHeader.timeLimit && <p className="text-indigo-600 font-bold"><Clock size={12} className="inline mr-1" />{worksheetHeader.timeLimit}</p>}
+                    </div>
+                  </div>
+                  {worksheetHeader.studentNameField && (
+                    <div className="flex items-center gap-4 pt-2">
+                      <span className="text-sm font-bold text-slate-700">성명:</span>
+                      <div className="flex-1 border-b border-slate-300 h-6"></div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
             <div className="p-10 border-b border-slate-100 bg-white sticky top-0 z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
               <div>
                 <div className="flex items-center gap-2 mb-3">
@@ -495,7 +723,7 @@ export default function App() {
                 </div>
                 <div>
                   <h3 className="text-2xl font-black text-slate-900 tracking-tight flex items-center gap-2">
-                    데이터베이스 <span className="text-slate-300 text-lg font-medium">|</span> 
+                    데이터베이스 <span className="text-slate-300 text-lg font-medium">|</span>
                     <span className={isEditMode ? "text-indigo-600" : "text-slate-400"}>
                       {isEditMode ? "수정 모드 (Spreadsheet)" : "보기 모드"}
                     </span>
@@ -510,13 +738,13 @@ export default function App() {
               <div className="flex items-center gap-3">
                 {isEditMode ? (
                   <>
-                    <button 
+                    <button
                       onClick={handleAddRow}
                       className="flex items-center gap-2 px-5 py-2.5 bg-slate-100 text-slate-700 rounded-xl text-xs font-black hover:bg-slate-200 transition-all border border-slate-200"
                     >
                       <Plus size={16} /> 행 추가
                     </button>
-                    <button 
+                    <button
                       onClick={saveTableChanges}
                       className="flex items-center gap-2 px-6 py-2.5 bg-indigo-600 text-white rounded-xl text-xs font-black hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100"
                     >
@@ -524,27 +752,27 @@ export default function App() {
                     </button>
                   </>
                 ) : (
-                  <button 
+                  <button
                     onClick={() => setIsEditMode(true)}
                     className="flex items-center gap-2 px-6 py-2.5 bg-white text-indigo-600 border-2 border-indigo-600 rounded-xl text-xs font-black hover:bg-indigo-50 transition-all"
                   >
                     <Edit3 size={16} /> 테이블 수정하기
                   </button>
                 )}
-                <button onClick={() => {setShowMasterTable(false); setIsEditMode(false);}} className="p-3 hover:bg-slate-100 rounded-2xl text-slate-400 hover:text-slate-900 transition-all"><X size={24} /></button>
+                <button onClick={() => { setShowMasterTable(false); setIsEditMode(false); }} className="p-3 hover:bg-slate-100 rounded-2xl text-slate-400 hover:text-slate-900 transition-all" title="마스터 테이블 닫기"><X size={24} /></button>
               </div>
             </div>
-            
+
             {/* Search Section */}
             <div className="px-8 py-5 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between gap-6">
               <div className="relative flex-1">
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
-                <input 
-                  type="text" 
-                  placeholder="단어, 뜻, 유형, 학년으로 검색..." 
-                  value={tableSearch} 
-                  onChange={(e) => setTableSearch(e.target.value)} 
-                  className="w-full pl-12 pr-4 py-4 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 transition-all font-medium text-sm shadow-sm" 
+                <input
+                  type="text"
+                  placeholder="단어, 뜻, 유형, 학년으로 검색..."
+                  value={tableSearch}
+                  onChange={(e) => setTableSearch(e.target.value)}
+                  className="w-full pl-12 pr-4 py-4 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 transition-all font-medium text-sm shadow-sm"
                 />
               </div>
               {isEditMode && (
@@ -574,7 +802,7 @@ export default function App() {
                         {/* Action Column for Edit Mode */}
                         {isEditMode && (
                           <td className="px-2 text-center align-middle">
-                            <button 
+                            <button
                               onClick={() => handleDeleteRow(vocabData.indexOf(v))}
                               className="p-2 text-red-300 hover:text-red-600 transition-colors"
                             >
@@ -587,14 +815,14 @@ export default function App() {
                         <td className={`px-6 py-4 border-y border-l border-slate-100 rounded-l-[24px] bg-white ${isEditMode ? 'border-indigo-200' : 'group-hover:border-indigo-100'}`}>
                           {isEditMode ? (
                             <div className="space-y-2">
-                              <input 
-                                value={v.word} 
+                              <input
+                                value={v.word}
                                 onChange={(e) => handleCellChange(vocabData.indexOf(v), 'word', e.target.value)}
                                 placeholder="Word"
                                 className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-lg font-black text-indigo-600 focus:bg-white outline-none focus:ring-2 focus:ring-indigo-500"
                               />
-                              <input 
-                                value={v.meaning} 
+                              <input
+                                value={v.meaning}
                                 onChange={(e) => handleCellChange(vocabData.indexOf(v), 'meaning', e.target.value)}
                                 placeholder="Meaning"
                                 className="w-full px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-sm font-bold text-slate-500 focus:bg-white outline-none focus:ring-2 focus:ring-indigo-500"
@@ -613,8 +841,8 @@ export default function App() {
                         {/* Level Selection */}
                         <td className={`px-6 py-4 border-y border-slate-100 bg-white text-center ${isEditMode ? 'border-indigo-200' : 'group-hover:border-indigo-100'}`}>
                           {isEditMode ? (
-                            <select 
-                              value={v.level} 
+                            <select
+                              value={v.level}
                               onChange={(e) => handleCellChange(vocabData.indexOf(v), 'level', e.target.value)}
                               className="w-full px-2 py-2 bg-slate-50 border border-slate-200 rounded-lg text-[10px] font-black uppercase outline-none focus:ring-2 focus:ring-indigo-500"
                             >
@@ -630,8 +858,8 @@ export default function App() {
                         {/* Question Types */}
                         <td className={`px-6 py-4 border-y border-slate-100 bg-white ${isEditMode ? 'border-indigo-200' : 'group-hover:border-indigo-100'}`}>
                           {isEditMode ? (
-                            <textarea 
-                              value={v.questionTypes.join(', ')} 
+                            <textarea
+                              value={v.questionTypes.join(', ')}
                               onChange={(e) => handleCellChange(vocabData.indexOf(v), 'questionTypes', e.target.value)}
                               placeholder="Types (comma separated)"
                               className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-[10px] font-bold h-20 resize-none outline-none focus:ring-2 focus:ring-indigo-500"
@@ -709,7 +937,7 @@ export default function App() {
                 </table>
               </div>
             </div>
-            
+
             {/* Pagination */}
             <div className="px-8 py-4 flex items-center justify-between border-t border-slate-100 bg-white shrink-0">
               <p className="text-xs text-slate-400 font-bold">
@@ -741,7 +969,7 @@ export default function App() {
               <p className="text-[10px] text-slate-400 font-black uppercase tracking-[0.3em]">Smart AI Dataset Engine v2.5</p>
               {isEditMode && (
                 <div className="flex items-center gap-4">
-                   <p className="text-[10px] text-indigo-400 font-bold">변경사항은 브라우저에 자동 저장됩니다.</p>
+                  <p className="text-[10px] text-indigo-400 font-bold">변경사항은 브라우저에 자동 저장됩니다.</p>
                 </div>
               )}
             </div>
@@ -749,7 +977,65 @@ export default function App() {
         </div>
       )}
 
-      <style dangerouslySetInnerHTML={{ __html: `
+      {/* Feature 4: History Sidebar */}
+      {showHistory && (
+        <div className="fixed inset-0 z-[100] flex justify-end">
+          <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onClick={() => setShowHistory(false)} />
+          <div className="relative bg-white w-full max-w-md h-full shadow-2xl flex flex-col animate-in slide-in-from-right duration-300">
+            <div className="p-6 border-b border-slate-100 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-indigo-600 rounded-xl text-white">
+                  <History size={20} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-black text-slate-900">문제지 이력</h3>
+                  <p className="text-[10px] text-slate-400 font-bold">{history.length}개 저장됨 (최대 20개)</p>
+                </div>
+              </div>
+              <button onClick={() => setShowHistory(false)} className="p-2 hover:bg-slate-100 rounded-xl text-slate-400" title="이력 닫기"><X size={20} /></button>
+            </div>
+            <div className="flex-1 overflow-auto p-4 space-y-3">
+              {history.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full opacity-40 gap-3">
+                  <FolderOpen size={48} className="text-slate-300" />
+                  <p className="text-sm font-bold text-slate-400">아직 생성된 문제지가 없습니다</p>
+                </div>
+              ) : (
+                history.map(item => (
+                  <div key={item.id} className="bg-slate-50 rounded-2xl p-5 border border-slate-100 hover:border-indigo-100 transition-all">
+                    <div className="flex items-start justify-between mb-2">
+                      <div className="flex-1">
+                        <p className="text-sm font-black text-slate-800 leading-tight">{item.worksheet.title}</p>
+                        <div className="flex items-center gap-2 mt-1.5">
+                          <span className="text-[9px] font-black text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">{item.worksheet.grade}</span>
+                          <span className="text-[9px] font-bold text-slate-400">{item.worksheet.questions.length}문항</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between mt-3">
+                      <span className="text-[10px] text-slate-400 font-medium">
+                        <Calendar size={10} className="inline mr-1" />
+                        {new Date(item.createdAt).toLocaleDateString('ko-KR', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                      </span>
+                      <div className="flex gap-2">
+                        <button onClick={() => handleLoadHistory(item)} className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-[10px] font-black hover:bg-indigo-700 transition">
+                          불러오기
+                        </button>
+                        <button onClick={() => handleDeleteHistory(item.id)} className="px-3 py-1.5 bg-white border border-red-200 text-red-500 rounded-lg text-[10px] font-black hover:bg-red-50 transition" title="이력 삭제">
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <style dangerouslySetInnerHTML={{
+        __html: `
         @keyframes shake {
           0%, 100% { transform: translateX(0); }
           25% { transform: translateX(-4px); }
@@ -762,6 +1048,7 @@ export default function App() {
           main { margin-top: 0 !important; width: 100% !important; max-width: 100% !important; padding: 0 !important; }
           nav { display: none !important; }
           .rounded-\\[40px\\], .rounded-\\[32px\\] { border-radius: 0 !important; border: none !important; box-shadow: none !important; }
+          .print-header { padding: 20px 40px 0 !important; }
         }
         .overflow-auto::-webkit-scrollbar {
           width: 8px;
